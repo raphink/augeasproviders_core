@@ -58,6 +58,15 @@ Puppet::Type.type(:augeasprovider).provide(:default) do
     (last + 1).to_s
   end
 
+  def self.augeas_file_resource(resource)
+    resource.catalog.resources.each { |r|
+      if r.is_a?(Puppet::Type.type(:augeas_file)) && r[:path] == target(resource)
+        return r
+      end
+    }
+    nil
+  end
+
   # Returns an Augeas handler.
   #
   # On Puppet >= 3.4, stores and returns a shared Augeas handler
@@ -148,6 +157,8 @@ Puppet::Type.type(:augeasprovider).provide(:default) do
   # @api public
   def self.augsave!(aug, reload = false)
     begin
+      p aug.match('/augeas//*')
+      p aug.get('$resource')
       aug.save!
     rescue Augeas::Error
       errors = []
@@ -552,9 +563,18 @@ Puppet::Type.type(:augeasprovider).provide(:default) do
   # @see #resource_path
   # @api public
   def self.setvars(aug, resource = nil)
-    aug.set('/augeas/context', "/files#{target(resource)}")
-    aug.defnode('target', "/files#{target(resource)}", nil)
+    if augeas_file_resource(resource)
+      ppath = "/parsed_file/#{parsed_resource_path(resource)}"
+      aug.set('/augeas/context', ppath)
+      aug.defnode('target', ppath, nil)
+    else
+      aug.set('/augeas/context', "/files#{target(resource)}")
+      aug.defnode('target', "/files#{target(resource)}", nil)
+    end
     aug.defvar('resource', resource_path(resource)) if resource
+    aug.match('/augeas/variables/*').each { |v|
+      p "#{v} = #{aug.get(v)}"
+    }
   end
 
   # Gets the path expression representing the file being managed.
@@ -598,9 +618,9 @@ Puppet::Type.type(:augeasprovider).provide(:default) do
   def self.parsed_as?(text, path, lens)
     Augeas.open(nil, nil, Augeas::NO_MODL_AUTOLOAD) do |aug|
       if aug.respond_to? :text_store
-        aug.set('/input', text)
-        if aug.text_store(lens, '/input', '/parsed')
-          return aug.match("/parsed/#{path}").any?
+        aug.set('/input_file', text)
+        if aug.text_store(lens, '/input_file', '/parsed_file')
+          return aug.match("/parsed_file/#{path}").any?
         end
       else
         # ruby-augeas < 0.5 doesn't support text_store
@@ -670,30 +690,10 @@ Puppet::Type.type(:augeasprovider).provide(:default) do
     aug = aug_handler
     file = target(resource)
     begin
-      lens_name = lens[/[^\.]+/]
-      if aug.match("/augeas/load/#{lens_name}").empty?
-        aug.transform(
-          :lens => lens,
-          :name => lens_name,
-          :incl => file,
-          :excl => []
-        )
-        aug.load!
-      elsif aug.match("/augeas/load/#{lens_name}/incl[.='#{file}']").empty?
-        # Only add missing file
-        aug.set("/augeas/load/#{lens_name}/incl[.='#{file}']", file)
-        aug.load!
-      end
-
-      if File.exist?(file) && aug.match("/files#{file}").empty?
-        message = aug.get("/augeas/files#{file}/error/message")
-        unless aug.match("/augeas/files#{file}/error/pos").empty?
-          line = aug.get("/augeas/files#{file}/error/line")
-          char = aug.get("/augeas/files#{file}/error/char")
-          message += " (line:#{line}, character:#{char})"
-        end
-        from = loadpath.nil? ? '' : " from #{loadpath}"
-        fail("Augeas didn't load #{file} with #{lens}#{from}: #{message}")
+      if r = augeas_file_resource(resource)
+        setup_augeas_store(aug, resource, r[:base])
+      else
+        setup_augeas_load(aug, file)
       end
 
       if block_given?
@@ -713,6 +713,57 @@ Puppet::Type.type(:augeasprovider).provide(:default) do
       if aug && block_given? && !supported?(:post_resource_eval)
         augsave!(aug) if autosave
         augclose!(aug)
+      end
+    end
+  end
+
+
+  def self.setup_augeas_load(aug, file)
+    lens_name = lens[/[^\.]+/]
+    if aug.match("/augeas/load/#{lens_name}").empty?
+      aug.transform(
+        :lens => lens,
+        :name => lens_name,
+        :incl => file,
+        :excl => []
+      )
+      aug.load!
+    elsif aug.match("/augeas/load/#{lens_name}/incl[.='#{file}']").empty?
+      # Only add missing file
+      aug.set("/augeas/load/#{lens_name}/incl[.='#{file}']", file)
+      aug.load!
+    end
+
+    if File.exist?(file) && aug.match("/files#{file}").empty?
+      message = aug.get("/augeas/files#{file}/error/message")
+      unless aug.match("/augeas/files#{file}/error/pos").empty?
+        line = aug.get("/augeas/files#{file}/error/line")
+        char = aug.get("/augeas/files#{file}/error/char")
+        message += " (line:#{line}, character:#{char})"
+      end
+      from = loadpath.nil? ? '' : " from #{loadpath}"
+      fail("Augeas didn't load #{file} with #{lens}#{from}: #{message}")
+    end
+  end
+
+  def self.parsed_resource_path(resource)
+    "#{resource.type}#{target(resource)}"
+  end
+
+  def self.setup_augeas_store(aug, resource, base)
+    rpath = parsed_resource_path(resource)
+    ipath = "/input_file/#{rpath}"
+    if aug.match(ipath).empty?
+      # TODO: error checking on File.read
+      base_content = File.read(base)
+      aug.set(ipath, base_content)
+      ppath = "/parsed/#{rpath}"
+      p "lens=#{lens}, ipath=#{ipath}, ppath=#{ppath}"
+      succ = aug.text_store(lens, ipath, ppath)
+      unless succ
+        p aug.match('/augeas//*')
+        err = aug.get("/augeas/text/#{ppath}/error/message")
+        fail("Failed to parse content:\n#{err}")
       end
     end
   end
@@ -922,7 +973,11 @@ Puppet::Type.type(:augeasprovider).provide(:default) do
   # Default method to determine the existence of a resource
   # can be overridden if necessary
   def exists?
+    puts "exists? #{resource[:name]}"
     augopen do |aug|
+      puts "$resource=#{aug.get('/augeas/variables/resource')}"
+      puts "yes" unless aug.match('$resource').empty?
+      p aug.match('$resource')
       not aug.match('$resource').empty?
     end
   end
@@ -955,5 +1010,9 @@ Puppet::Type.type(:augeasprovider).provide(:default) do
   # @return [String] new node label
   def next_seq(matches)
     self.class.next_seq(matches)
+  end
+
+  def augeas_file_resource
+    self.augeas_file_resource(resource)
   end
 end
